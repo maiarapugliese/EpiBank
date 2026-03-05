@@ -1,6 +1,15 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import text
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+
+try:
+    from scipy.stats import chi2_contingency
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
 
 from db import get_engine, init_db, insert_record, update_record, delete_record
 
@@ -54,6 +63,28 @@ label {
 
 .stTextInput input {
     background-color: #ffffff !important;
+}
+
+/* texto digitado nos campos */
+
+.stTextInput input {
+    color: #0b6b3a !important;
+}
+
+.stTextArea textarea {
+    color: #0b6b3a !important;
+}
+
+.stNumberInput input {
+    color: #0b6b3a !important;
+}
+
+.stSelectbox div[data-baseweb="select"] {
+    color: #0b6b3a !important;
+}
+
+.stDateInput input {
+    color: #0b6b3a !important;
 }
 
 /* textarea */
@@ -143,6 +174,115 @@ AGE_GROUPS = [
     ">10 anos"
 ]
 
+def _normalize_text(x: str) -> str:
+    if x is None:
+        return ""
+    return str(x).strip().lower()
+
+def make_positive_flag(df: pd.DataFrame) -> pd.Series:
+    """
+    Cria a coluna 'positive' (1/0) usando 'result' e 'findings'.
+    Ajuste os termos se seu laboratório usa outros padrões.
+    """
+    pos_terms = [
+        "positivo", "pos", "+", "presença", "presenca", "encontrado", "detectado",
+        "giardia", "ancylostoma", "ancilostoma", "toxocara", "cystoisospora",
+        "isospora", "trichuris", "dipylidium", "coccidia", "coccídeo", "coccidio",
+        "helminto", "ovo", "oocisto", "larva", "cisto"
+    ]
+    neg_terms = ["negativo", "neg", "-", "ausência", "ausencia", "não detectado", "nao detectado", "sem achados"]
+
+    rr = df.get("result", pd.Series([""] * len(df))).map(_normalize_text)
+    ff = df.get("findings", pd.Series([""] * len(df))).map(_normalize_text)
+    text_all = (rr + " " + ff).str.strip()
+
+    # primeiro marca negativos explícitos
+    neg = text_all.apply(lambda s: any(t in s for t in neg_terms))
+
+    # marca positivos explícitos
+    pos = text_all.apply(lambda s: any(t in s for t in pos_terms))
+
+    # regra final: se tem positivo e não tem negativo explícito -> positivo
+    positive = (pos & ~neg).astype(int)
+    return positive
+
+def prep_df_for_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # datas
+    if "analysis_date" in df.columns:
+        df["analysis_date"] = pd.to_datetime(df["analysis_date"], errors="coerce")
+
+    # garante colunas esperadas
+    for col in ["species", "sex", "age_group", "sample_type", "method", "result", "findings"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace({"nan": "", "None": ""}).str.strip()
+
+    # positivo
+    df["positive"] = make_positive_flag(df)
+
+    # mês (tendência temporal)
+    if "analysis_date" in df.columns:
+        df["month"] = df["analysis_date"].dt.to_period("M").astype(str)
+
+    # ordem de faixa etária
+    if "age_group" in df.columns:
+        df["age_group"] = pd.Categorical(df["age_group"], categories=AGE_GROUPS, ordered=True)
+
+    return df
+
+def table_profile(df: pd.DataFrame) -> dict:
+    """
+    Retorna tabelas de frequência (%) para variáveis principais.
+    """
+    out = {}
+    for var in ["species", "sex", "age_group", "sample_type", "method"]:
+        if var in df.columns:
+            vc = df[var].replace("", np.nan).dropna().value_counts()
+            pct = (vc / vc.sum() * 100).round(1)
+            out[var] = pd.DataFrame({"n": vc, "%": pct})
+    return out
+
+def table_prevalence(df: pd.DataFrame, by: str) -> pd.DataFrame:
+    """
+    Prevalência por categoria (n, positivos, %).
+    """
+    if by not in df.columns:
+        return pd.DataFrame()
+
+    d = df.copy()
+    d = d[d[by].replace("", np.nan).notna()]
+
+    g = d.groupby(by, dropna=True)["positive"].agg(
+        n="count",
+        positivos="sum"
+    ).reset_index()
+
+    g["prevalência_%"] = (g["positivos"] / g["n"] * 100).round(1)
+    return g
+
+def chi_square(df: pd.DataFrame, by: str):
+    """
+    Qui-quadrado de Pearson: positive x categoria.
+    """
+    if not SCIPY_OK or by not in df.columns:
+        return None
+
+    d = df.copy()
+    d = d[d[by].replace("", np.nan).notna()]
+    ct = pd.crosstab(d[by], d["positive"])
+    # garante colunas 0 e 1
+    if 0 not in ct.columns:
+        ct[0] = 0
+    if 1 not in ct.columns:
+        ct[1] = 0
+    ct = ct[[0, 1]]
+
+    if ct.shape[0] < 2:
+        return None
+
+    chi2, p, dof, expected = chi2_contingency(ct.values)
+    return {"p": float(p), "chi2": float(chi2), "dof": int(dof), "table": ct}
 
 # -------------------------------------------------------
 # ABAS
@@ -170,11 +310,12 @@ with tab1:
 
         with col1:
 
+            sample_id = st.text_input("ID da amostra")
             patient_id = st.text_input("ID do paciente")
 
             species = st.selectbox(
                 "Espécie",
-                ["Canino","Felino","Bovino", "Equídeo", "Caprino", "Ovino", "Outro"]
+                ["Canino","Felino", "Equídeo", "Bovino", "Caprino", "Ovino", "Outro"]
             )
 
             sex = st.selectbox(
@@ -228,7 +369,7 @@ with tab1:
                 "notes": notes
             }
 
-            insert_record(data)
+            insert_record(engine, data)
 
             st.success("Registro salvo com sucesso!")
 
@@ -319,9 +460,35 @@ with tab2:
 
             if st.button("🗑️ Excluir"):
 
-                delete_record(id_sel)
+                delete_record(engine, id_sel)
 
                 st.warning("Registro excluído")
+
+        st.divider()
+        st.subheader("📊 Análises automáticas")
+
+        df_a = prep_df_for_analysis(df)
+
+        total = len(df_a)
+        pos = int(df_a["positive"].sum())
+        prev = (pos / total * 100) if total else 0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Registros", f"{total}")
+        c2.metric("Positivos", f"{pos}")
+        c3.metric("Prevalência (%)", f"{prev:.1f}")
+
+        # --------- Tendência temporal ----------
+        if "month" in df_a.columns:
+            st.markdown("### 📈 Série temporal (exames por mês)")
+            ts = df_a.groupby("month")["id"].count().reset_index().rename(columns={"id": "n"})
+            st.dataframe(ts, use_container_width=True)
+
+            fig = plt.figure()
+            plt.plot(ts["month"], ts["n"])
+            plt.xticks(rotation=45, ha="right")
+            plt.ylabel("n de exames")
+            st.pyplot(fig)
 
 
 # =======================================================
@@ -382,4 +549,6 @@ Objetivos:
 
 Sistema desenvolvido por **MV. Ma. Maiara Duarte Pugliese** sob orientação da **Profa. Dra. Lorendane Millena de Carvalho**, durante a Residência Multiprofissional em Saúde Animal Integrada à Saúde Pública, no Hospital Universitário de Medicina Veterinária da Universidade Federal do Recôncavo da Bahia.
 
+
+Disponível em: https://github.com/maiarapugliese/EpiBank.git
 """)

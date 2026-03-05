@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS records (
     species TEXT,
     sex TEXT,
     breed TEXT,
-    age_years REAL,
+    age_group TEXT,
     fertility TEXT,
     origin TEXT,
     analysis_date TEXT,
